@@ -1,0 +1,134 @@
+name: Windows Build & Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get version from pubspec
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version:' pubspec.yaml | sed 's/version: //' | sed 's/+.*//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'master'
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build Windows
+        run: flutter build windows --release
+
+      - name: Create self-signed certificate and sign exe
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate `
+            -Subject "CN=SyncResto, O=SyncResto, C=TR" `
+            -Type CodeSigningCert `
+            -KeyAlgorithm RSA `
+            -KeyLength 2048 `
+            -HashAlgorithm SHA256 `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -NotAfter (Get-Date).AddYears(3)
+
+          $thumbprint = $cert.Thumbprint
+          Write-Host "Cert Thumbprint: $thumbprint"
+
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object { [version]($_.Directory.Parent.Name) } -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          Write-Host "signtool: $signtool"
+
+          $exePath = Get-ChildItem "build\windows\x64\runner\Release\*.exe" | Select-Object -First 1 -ExpandProperty FullName
+          Write-Host "Signing: $exePath"
+
+          & $signtool sign `
+            /fd SHA256 `
+            /td SHA256 `
+            /tr "http://timestamp.digicert.com" `
+            /sha1 $thumbprint `
+            /d "SyncResto Caller ID" `
+            /du "https://syncresto.com" `
+            "$exePath"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "signtool sign basarisiz oldu (exit $LASTEXITCODE)"
+            exit 1
+          }
+
+          Write-Host "--- Imza bilgisi ---"
+          & $signtool verify /v "$exePath" 2>&1 | Out-Host
+          $LASTEXITCODE = 0
+
+      - name: Create zip package
+        shell: pwsh
+        run: |
+          cd build/windows/x64/runner/Release
+          Compress-Archive -Path * -DestinationPath ../../../../../SyncResto-CallerID-Windows.zip -Force
+
+      - name: Calculate SHA-256 checksum
+        id: checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Path "SyncResto-CallerID-Windows.zip" -Algorithm SHA256).Hash
+          Write-Host "SHA256: $hash"
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload Windows Build (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SyncResto-CallerID-Windows
+          path: SyncResto-CallerID-Windows.zip
+          retention-days: 30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}-${{ github.run_number }}
+          name: SyncResto Caller ID v${{ steps.version.outputs.version }} (build ${{ github.run_number }})
+          body: |
+            ## SyncResto Caller ID v${{ steps.version.outputs.version }}
+
+            Restoran gelen arama yöneticisi — CIDShow donanımı ile entegre.
+
+            ### Windows Kurulum
+            1. `SyncResto-CallerID-Windows.zip` indir + çıkart
+            2. `SyncResto Caller ID.exe`'yi çalıştır
+            3. Setup ekranında admin panelden aldığın `SR_CID_xxx` integration key'i gir
+            4. CIDShow USB cihazını tak — sağ üst pill "Cihaz Bağlı" olur
+            5. Telefon çaldığında otomatik müşteri kartı açılır
+
+            ### Özellikler
+            - CIDShow USB Caller ID donanım entegrasyonu (cid.dll FFI)
+            - panel.syncresto.com integration key auth
+            - Canlı çağrı takibi + geçmiş + müşteri detay modal
+            - Test mode (`softTest.txt` toggle ile cihazsız test)
+
+            ### İmza
+            - Self-signed (SyncResto)
+            - SHA-256: `${{ steps.checksum.outputs.sha256 }}`
+          files: SyncResto-CallerID-Windows.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
