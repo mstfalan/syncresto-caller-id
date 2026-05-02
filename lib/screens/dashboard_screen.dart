@@ -99,11 +99,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
           Consumer<DeviceProvider>(
             builder: (_, dev, __) {
               if (!dev.supported) return const SizedBox.shrink();
-              if (!dev.initialized) {
-                return Padding(
-                  padding: const EdgeInsets.only(left: 6),
-                  child: _StatusPill(label: 'Cihaz: hata', ok: false),
-                );
+              String label;
+              bool ok;
+              if (!dev.initAttempted) {
+                label = 'Cihaz Hazır Değil';
+                ok = false;
+              } else if (!dev.initialized) {
+                label = 'Cihaz: hata';
+                ok = false;
+              } else {
+                label = dev.connected ? 'Cihaz Bağlı' : 'Cihaz Bekleniyor';
+                ok = dev.connected;
               }
               return Padding(
                 padding: const EdgeInsets.only(left: 6),
@@ -113,10 +119,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     context: context,
                     builder: (_) => const DeviceStatusDialog(),
                   ),
-                  child: _StatusPill(
-                    label: dev.connected ? 'Cihaz Bağlı' : 'Cihaz Bekleniyor',
-                    ok: dev.connected,
-                  ),
+                  child: _StatusPill(label: label, ok: ok),
                 ),
               );
             },
