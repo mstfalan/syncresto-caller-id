@@ -91,10 +91,21 @@ class CallerIdService {
         return false;
       }
 
-      // 4. DLL yükle
+      // 4. Pre-flight: Win32 LoadLibraryW ile dependency check
+      // (DynamicLibrary.open dependency eksikse hard crash; LoadLibraryW null döner)
+      final preCheck = _tryLoadLibraryW(dllPath);
+      if (preCheck == 0) {
+        final err = _getLastErrorMessage();
+        _lastError =
+            'cid.dll yüklenemedi (Win32 hata): $err\n'
+            'Çözüm: Visual C++ Redistributable kurun veya cid.dll bağımlılıklarını kontrol edin.';
+        return false;
+      }
+
+      // 5. DynamicLibrary.open — artık güvenli, çünkü pre-check geçti
       final dll = DynamicLibrary.open(dllPath);
 
-      // 5. SetEvents bul
+      // 6. SetEvents bul
       final setEvents = dll.lookupFunction<_SetEventsNative, _SetEventsDart>('SetEvents');
 
       // 6. Statik callback'leri bağla (GC korumalı)
@@ -108,6 +119,48 @@ class CallerIdService {
       _lastError = 'CID init error: $e';
       if (kDebugMode) print('CID init error: $e\n$st');
       return false;
+    }
+  }
+
+  // Win32 LoadLibraryW prototypeları
+  // HMODULE LoadLibraryW(LPCWSTR lpLibFileName);
+  // DWORD GetLastError();
+  // DWORD FormatMessageW(...);
+
+  int _tryLoadLibraryW(String path) {
+    if (!Platform.isWindows) return 0;
+    try {
+      final kernel32 = DynamicLibrary.open('kernel32.dll');
+      final loadLibrary = kernel32
+          .lookupFunction<IntPtr Function(Pointer<Utf16>), int Function(Pointer<Utf16>)>(
+              'LoadLibraryW');
+      final pathPtr = path.toNativeUtf16();
+      try {
+        return loadLibrary(pathPtr);
+      } finally {
+        calloc.free(pathPtr);
+      }
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  String _getLastErrorMessage() {
+    if (!Platform.isWindows) return 'unknown';
+    try {
+      final kernel32 = DynamicLibrary.open('kernel32.dll');
+      final getLastError = kernel32.lookupFunction<Uint32 Function(), int Function()>('GetLastError');
+      final code = getLastError();
+      // Common Windows DLL load error codes
+      switch (code) {
+        case 126: return 'ERROR_MOD_NOT_FOUND (126) — bağımlı bir DLL bulunamadı';
+        case 127: return 'ERROR_PROC_NOT_FOUND (127) — fonksiyon bulunamadı';
+        case 193: return 'ERROR_BAD_EXE_FORMAT (193) — yanlış mimari (32/64-bit uyumsuz)';
+        case 998: return 'ERROR_NOACCESS (998) — bellek erişim hatası';
+        default: return 'Win32 error code $code';
+      }
+    } catch (_) {
+      return 'unknown';
     }
   }
 
