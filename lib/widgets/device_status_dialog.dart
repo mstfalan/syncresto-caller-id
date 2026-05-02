@@ -65,6 +65,19 @@ class DeviceStatusDialog extends StatelessWidget {
                 const SizedBox(height: 8),
                 _row('Çözüm',
                     'CIDShow donanımı USB ile Windows bilgisayara takılır. macOS sürümü sadece UI/test içindir.'),
+              ] else if (!dev.initAttempted) ...[
+                _row('Durum', 'cid.dll henüz yüklenmedi'),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  icon: const Icon(Icons.power_settings_new, size: 18),
+                  label: const Text('Cihazı Bağla (cid.dll yükle)'),
+                  onPressed: () => context.read<DeviceProvider>().initialize(),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Uyarı: cid.dll Delphi runtime gerektirir. Sistem hazır değilse uygulama hata verebilir.',
+                  style: TextStyle(fontSize: 10, color: cs.onSurfaceVariant),
+                ),
               ] else ...[
                 _row('SDK',
                     dev.initialized ? 'cid.dll yüklü' : 'cid.dll YÜKLENMEDİ'),

@@ -65,19 +65,9 @@ class SyncRestoCallerIdApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => AuthProvider()),
         ChangeNotifierProvider(create: (_) => CallsProvider()),
         ChangeNotifierProvider(
-          // FFI init Windows-only ve hata yutar — crash etmez
-          create: (_) {
-            final dp = DeviceProvider();
-            // Microtask'a at, build'i bloklama
-            scheduleMicrotask(() async {
-              try {
-                await dp.initialize();
-              } catch (e, st) {
-                await _logCrash(e, st, 'DeviceProvider.initialize');
-              }
-            });
-            return dp;
-          },
+          // FFI init manuel — kullanıcı Dashboard'da "Cihazı Bağla" butonuna basınca.
+          // Açılışta DLL yüklemiyoruz (Delphi VCL runtime eksik = process crash riski).
+          create: (_) => DeviceProvider(),
         ),
       ],
       child: MaterialApp(
