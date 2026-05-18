@@ -1,92 +1,31 @@
 // =============================================================================
-// SyncResto Caller ID — Native cid.dll FFI servisi (ISOLATE-BASED)
-// 18 May 2026 — Mustafa: "Cihazı Bağla" basınca uygulama kapanıyor sorununa
-// GARANTİ çözüm. DLL load + native callback'ler ayrı isolate'da çalışır.
-// Native crash → sadece worker isolate ölür, ANA uygulama hayatta kalır.
-// Cihaz bağlıysa çağrılar SendPort ile main isolate'a iletilir.
+// CallerIdService — v0.3.0+7
+// Mimari: SEPARATE PROCESS HELPER
 //
-// Eski API ile UI uyumluluğu korundu:
-//   - CallerIdService.instance.initialize()
-//   - CallerIdService.instance.incomingCalls (Stream)
-//   - CallerIdService.instance.deviceStatus (Stream)
-//   - lastError, isInitialized, dispose, setTestMode, isTestModeEnabled
+// cid.dll'i ayri bir process'te (SyncResto.CallerIdHelper.exe) yukleriz.
+// Helper crash olursa SADECE o process oler, Flutter app yasamaya devam eder.
+// Helper stdout'una JSON line yazar, biz parse edip stream'e push ederiz.
+//
+// Onceki denemeler:
+//   v0.1.x: DynamicLibrary.open + Pointer.fromFunction → main isolate crash
+//   v0.2.x: dart:isolate → ayni OS process oldugundan ayni crash
+//   v0.3.x: Process.start ayri exe → garanti coker ama main app yasar
 // =============================================================================
 
 import 'dart:async';
-import 'dart:ffi';
+import 'dart:convert';
 import 'dart:io';
-import 'dart:isolate';
 import 'package:crypto/crypto.dart';
-import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import '../models/call_event.dart';
 
-// ---------------------------------------------------------------------------
-// FFI typedefs (worker isolate içinde kullanılır)
-// CallerIDFunc(serial, line, phoneNumber, dateTime, other)  — wchar_t* x5
-// SignalFunc(deviceModel, deviceSerial, s1, s2, s3, s4)     — wchar_t* x2 + int x4
-// SetEvents(CallerIDCallback, SignalCallback)
-// ---------------------------------------------------------------------------
-
-typedef _CallerIdNative = Void Function(
-  Pointer<Utf16> serial,
-  Pointer<Utf16> line,
-  Pointer<Utf16> phone,
-  Pointer<Utf16> dt,
-  Pointer<Utf16> other,
-);
-typedef _SignalNative = Void Function(
-  Pointer<Utf16> model,
-  Pointer<Utf16> serial,
-  Int32 s1,
-  Int32 s2,
-  Int32 s3,
-  Int32 s4,
-);
-
-typedef _SetEventsNative = Void Function(
-  Pointer<NativeFunction<_CallerIdNative>>,
-  Pointer<NativeFunction<_SignalNative>>,
-);
-typedef _SetEventsDart = void Function(
-  Pointer<NativeFunction<_CallerIdNative>>,
-  Pointer<NativeFunction<_SignalNative>>,
-);
-
-/// Bilinen DLL hash'leri (asset'le birlikte gelen).
 const Map<String, String> _expectedHashes = {
   'cid_x64.dll': '79d7297be2df563802fddf4ec40bd6407da9cdc58084a475d8b17d6bb0585905',
   'cid_x86.dll': '490b6d77af54a21b980e22efdb687c6320a5e4194aba67d7add12946d62d1357',
 };
-
-// Worker isolate → main isolate mesaj tipleri
-class _WorkerInitOk {
-  const _WorkerInitOk();
-}
-class _WorkerInitError {
-  final String message;
-  const _WorkerInitError(this.message);
-}
-class _WorkerCallEvent {
-  final String deviceSerial, line, phoneNumber, other;
-  final int receivedAtMs;
-  const _WorkerCallEvent(this.deviceSerial, this.line, this.phoneNumber, this.receivedAtMs, this.other);
-}
-class _WorkerSignal {
-  final String deviceModel, deviceSerial;
-  final int s1, s2, s3, s4;
-  const _WorkerSignal(this.deviceModel, this.deviceSerial, this.s1, this.s2, this.s3, this.s4);
-}
-
-// Worker isolate parametresi
-class _WorkerArgs {
-  final SendPort mainPort;
-  final String dllPath;
-  const _WorkerArgs(this.mainPort, this.dllPath);
-}
 
 class CallerIdService {
   CallerIdService._();
@@ -94,155 +33,249 @@ class CallerIdService {
 
   final _callController = StreamController<CallEvent>.broadcast();
   final _signalController = StreamController<DeviceSignal>.broadcast();
+  final _statusController = StreamController<String>.broadcast();
 
   Stream<CallEvent> get incomingCalls => _callController.stream;
   Stream<DeviceSignal> get deviceStatus => _signalController.stream;
+  Stream<String> get statusMessages => _statusController.stream;
 
+  Process? _helper;
   bool _initialized = false;
+  bool _ready = false;
+  Timer? _heartbeat;
+
   bool get isInitialized => _initialized;
+  bool get isReady => _ready;
 
   String? _lastError;
   String? get lastError => _lastError;
 
-  Isolate? _workerIsolate;
-  ReceivePort? _receivePort;
-  StreamSubscription? _portSub;
-
-  /// Sadece Windows. Diğer platformlarda no-op (init false döner).
   Future<bool> initialize() async {
     if (!Platform.isWindows) {
-      _lastError = 'Caller ID donanımı sadece Windows üzerinde desteklenir';
+      _lastError = 'Caller ID donanimi sadece Windows uzerinde desteklenir';
       return false;
     }
-    if (_initialized) return true;
+    if (_initialized && _helper != null) return _ready;
 
     try {
-      // 1. Architecture seç
-      final isX64 = sizeOf<IntPtr>() == 8;
+      // 1. DLL'i temp'e cikar + hash dogrula
+      final isX64 = _detectX64();
       final dllName = isX64 ? 'cid_x64.dll' : 'cid_x86.dll';
-      final assetKey = 'assets/cid/$dllName';
+      final dllPath = await _extractAsset('assets/cid/$dllName', dllName);
 
-      // 2. Asset → temp file extract
-      final dllPath = await _extractDll(assetKey, dllName);
-
-      // 3. SHA-256 doğrula
-      final hashOk = await _verifyDllHash(dllPath, _expectedHashes[dllName]!);
+      final hashOk = await _verifyHash(dllPath, _expectedHashes[dllName]!);
       if (!hashOk) {
-        _lastError = 'cid.dll bütünlük kontrolü başarısız (hash mismatch)';
+        _lastError = 'cid.dll butunluk kontrolu basarisiz (hash mismatch)';
         return false;
       }
 
-      // 4. ISOLATE BAŞLAT — DLL load ve native callback'ler burada
-      // Crash olursa sadece worker isolate ölür, main isolate ayakta kalır.
-      _receivePort = ReceivePort();
-      final completer = Completer<bool>();
-      Timer? initTimeout;
-
-      _portSub = _receivePort!.listen((msg) {
-        if (msg is _WorkerInitOk) {
-          if (!completer.isCompleted) {
-            initTimeout?.cancel();
-            _initialized = true;
-            _lastError = null;
-            completer.complete(true);
-          }
-        } else if (msg is _WorkerInitError) {
-          if (!completer.isCompleted) {
-            initTimeout?.cancel();
-            _lastError = msg.message;
-            completer.complete(false);
-          }
-        } else if (msg is _WorkerCallEvent) {
-          try {
-            _callController.add(CallEvent(
-              deviceSerial: msg.deviceSerial,
-              line: msg.line,
-              phoneNumber: msg.phoneNumber,
-              receivedAt: DateTime.fromMillisecondsSinceEpoch(msg.receivedAtMs),
-              other: msg.other,
-            ));
-          } catch (_) {}
-        } else if (msg is _WorkerSignal) {
-          try {
-            _signalController.add(DeviceSignal(
-              deviceModel: msg.deviceModel,
-              deviceSerial: msg.deviceSerial,
-              signal1: msg.s1,
-              signal2: msg.s2,
-              signal3: msg.s3,
-              signal4: msg.s4,
-            ));
-          } catch (_) {}
-        }
-      });
-
-      // Worker isolate exit handler — native crash veya kasıtlı kill durumunda
-      final exitPort = ReceivePort();
-      exitPort.listen((_) {
-        if (kDebugMode) print('[CID] Worker isolate sonlandı');
-        // Worker öldüyse cihaz bağlantısı koptu, ama main process ayakta
-        if (_initialized) {
-          _initialized = false;
-          _lastError = 'cid.dll worker isolate sonlandı (cihaz bağlantısı koptu) — yeniden bağlamayı deneyin';
-        }
-        try { _signalController.add(DeviceSignal()); } catch (_) {}
-      });
-
-      // Error handler — isolate içinde unhandled exception varsa
-      final errorPort = ReceivePort();
-      errorPort.listen((err) {
-        if (kDebugMode) print('[CID] Worker isolate error: $err');
-      });
-
-      _workerIsolate = await Isolate.spawn<_WorkerArgs>(
-        _cidWorkerEntry,
-        _WorkerArgs(_receivePort!.sendPort, dllPath),
-        onExit: exitPort.sendPort,
-        onError: errorPort.sendPort,
-        errorsAreFatal: false, // crash olursa isolate ölsün AMA main process etkilenmesin
-        debugName: 'CidDllWorker',
+      // 2. Helper exe'yi temp'e cikar
+      final helperPath = await _extractAsset(
+        'assets/cid/SyncResto.CallerIdHelper.exe',
+        'SyncResto.CallerIdHelper.exe',
       );
 
-      // 15 saniye timeout — DLL takılırsa init başarısız sayılır
-      initTimeout = Timer(const Duration(seconds: 15), () {
-        if (!completer.isCompleted) {
-          _lastError = 'cid.dll yüklenme zaman aşımı (15sn). DLL veya bağımlılığı yanıt vermiyor.';
-          completer.complete(false);
+      // 3. Helper'i baslat
+      _helper = await Process.start(
+        helperPath,
+        [dllPath],
+        runInShell: false,
+        mode: ProcessStartMode.normal,
+      );
+
+      // 4. stdout dinle
+      _helper!.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen(_handleHelperLine, onError: (e) {
+        if (kDebugMode) print('[CID] stdout error: $e');
+      });
+
+      // 5. stderr log
+      _helper!.stderr
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((l) {
+        if (kDebugMode) print('[CID stderr] $l');
+      });
+
+      // 6. Process exit listen — crash olursa UI'ya bildir
+      _helper!.exitCode.then(_onHelperExit);
+
+      // 7. Heartbeat — her 30sn bir PING yolla
+      _heartbeat?.cancel();
+      _heartbeat = Timer.periodic(const Duration(seconds: 30), (_) {
+        if (_helper != null) {
+          try {
+            _helper!.stdin.writeln('PING');
+          } catch (_) {}
         }
       });
 
-      return await completer.future;
+      _initialized = true;
+      _statusController.add('Helper baslatildi, hazir bekleniyor...');
+      return true;
     } catch (e, st) {
-      _lastError = 'CID init error: $e';
-      if (kDebugMode) print('CID init error: $e\n$st');
+      _lastError = 'CID init exception: $e';
+      if (kDebugMode) print('CID init: $e\n$st');
       return false;
     }
   }
 
-  Future<String> _extractDll(String assetKey, String dllName) async {
+  void _handleHelperLine(String line) {
+    if (line.trim().isEmpty) return;
+    Map<String, dynamic> msg;
+    try {
+      msg = jsonDecode(line) as Map<String, dynamic>;
+    } catch (_) {
+      if (kDebugMode) print('[CID] parse error: $line');
+      return;
+    }
+
+    final type = msg['type'] as String?;
+    switch (type) {
+      case 'ready':
+        _ready = true;
+        _statusController.add('Cihaz dinleniyor');
+        break;
+      case 'call':
+        try {
+          final ev = CallEvent(
+            deviceSerial: (msg['serial'] as String?) ?? '',
+            line: (msg['line'] as String?) ?? '',
+            phoneNumber: (msg['phone'] as String?) ?? '',
+            receivedAt: DateTime.now(),
+            other: msg['other'] as String?,
+          );
+          _callController.add(ev);
+        } catch (e) {
+          if (kDebugMode) print('[CID] call parse: $e');
+        }
+        break;
+      case 'signal':
+        try {
+          final sig = DeviceSignal(
+            deviceModel: msg['model'] as String?,
+            deviceSerial: msg['serial'] as String?,
+            signal1: (msg['s1'] as num?)?.toInt() ?? 0,
+            signal2: (msg['s2'] as num?)?.toInt() ?? 0,
+            signal3: (msg['s3'] as num?)?.toInt() ?? 0,
+            signal4: (msg['s4'] as num?)?.toInt() ?? 0,
+          );
+          _signalController.add(sig);
+        } catch (e) {
+          if (kDebugMode) print('[CID] signal parse: $e');
+        }
+        break;
+      case 'error':
+        _lastError = msg['message'] as String?;
+        _statusController.add('Helper hata: $_lastError');
+        if (kDebugMode) print('[CID] helper error: $_lastError');
+        break;
+      case 'pong':
+        // heartbeat OK
+        break;
+      case 'bye':
+        _statusController.add('Helper kapaniyor');
+        break;
+    }
+  }
+
+  void _onHelperExit(int code) {
+    _ready = false;
+    _helper = null;
+    _heartbeat?.cancel();
+    if (code == 0) {
+      _statusController.add('Helper normal sekilde kapandi');
+    } else {
+      final reason = _exitCodeMessage(code);
+      _lastError = 'Helper beklenmedik sekilde kapandi (exit $code) — $reason';
+      _statusController.add(_lastError!);
+      if (kDebugMode) print('[CID] helper exited: $code');
+    }
+    // Otomatik restart YOK — kullanici "Tekrar Bagla" basacak (UI seviyesinde)
+  }
+
+  String _exitCodeMessage(int code) {
+    switch (code) {
+      case 2: return 'DLL yolu verilmedi';
+      case 3: return 'cid.dll dosyasi bulunamadi';
+      case 4: return 'cid.dll yuklenemedi (VC++ Redist gerekli olabilir)';
+      case 5: return 'SetEvents fonksiyonu yok';
+      case 6: return 'SetEvents cagrisi exception';
+      default:
+        // 0xc0000409 (-1073740791) STACK_BUFFER_OVERRUN, 0xc0000005 (-1073741819) AV
+        if (code == -1073740791) return 'STACK_BUFFER_OVERRUN (vendor SDK crash)';
+        if (code == -1073741819) return 'ACCESS_VIOLATION';
+        return 'bilinmeyen exit kodu';
+    }
+  }
+
+  /// Helper'i graceful kapat
+  Future<void> stop() async {
+    _heartbeat?.cancel();
+    if (_helper != null) {
+      try {
+        _helper!.stdin.writeln('EXIT');
+        await _helper!.exitCode.timeout(const Duration(seconds: 2),
+            onTimeout: () {
+          _helper?.kill();
+          return -1;
+        });
+      } catch (_) {
+        try { _helper?.kill(); } catch (_) {}
+      }
+    }
+    _helper = null;
+    _ready = false;
+    _initialized = false;
+  }
+
+  /// Crash sonrasi UI'dan "Tekrar Bagla" basildiginda
+  Future<bool> reconnect() async {
+    await stop();
+    return initialize();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
+  bool _detectX64() {
+    // Windows desktop her zaman x64 build aliyoruz, ama yine de check
+    try {
+      final arch = Platform.environment['PROCESSOR_ARCHITECTURE'] ?? '';
+      return arch.contains('64');
+    } catch (_) {
+      return true;
+    }
+  }
+
+  Future<String> _extractAsset(String assetKey, String fileName) async {
     final tempDir = await getTemporaryDirectory();
     final outDir = Directory(p.join(tempDir.path, 'syncresto_cid'));
     if (!outDir.existsSync()) outDir.createSync(recursive: true);
-    final outFile = File(p.join(outDir.path, dllName));
+    final outFile = File(p.join(outDir.path, fileName));
 
     final bytes = await rootBundle.load(assetKey);
     await outFile.writeAsBytes(bytes.buffer.asUint8List(), flush: true);
     return outFile.path;
   }
 
-  Future<bool> _verifyDllHash(String filePath, String expected) async {
+  Future<bool> _verifyHash(String filePath, String expected) async {
     final bytes = await File(filePath).readAsBytes();
     final actual = sha256.convert(bytes).toString();
     return actual.toLowerCase() == expected.toLowerCase();
   }
 
-  /// `softTest.txt` dosyası exe'nin yanına kopyalanırsa cid.dll sahte arama üretir
+  /// softTest.txt — cid.dll'in sahte arama uretmesi icin
+  /// Helper exe'nin yaninda olmali (temp/syncresto_cid/)
   Future<void> setTestMode(bool enabled) async {
     if (!Platform.isWindows) return;
-    final exeDir = File(Platform.resolvedExecutable).parent.path;
-    final softTest = File(p.join(exeDir, 'softTest.txt'));
+    final tempDir = await getTemporaryDirectory();
+    final softTest = File(p.join(tempDir.path, 'syncresto_cid', 'softTest.txt'));
     if (enabled) {
-      if (!softTest.existsSync()) await softTest.create();
+      if (!softTest.existsSync()) await softTest.create(recursive: true);
     } else {
       if (softTest.existsSync()) await softTest.delete();
     }
@@ -250,179 +283,14 @@ class CallerIdService {
 
   Future<bool> isTestModeEnabled() async {
     if (!Platform.isWindows) return false;
-    final exeDir = File(Platform.resolvedExecutable).parent.path;
-    return File(p.join(exeDir, 'softTest.txt')).existsSync();
+    final tempDir = await getTemporaryDirectory();
+    return File(p.join(tempDir.path, 'syncresto_cid', 'softTest.txt')).existsSync();
   }
 
   void dispose() {
-    try { _portSub?.cancel(); } catch (_) {}
-    try { _receivePort?.close(); } catch (_) {}
-    try { _workerIsolate?.kill(priority: Isolate.immediate); } catch (_) {}
-    _workerIsolate = null;
-    _receivePort = null;
-    _portSub = null;
-    _initialized = false;
-    try { _callController.close(); } catch (_) {}
-    try { _signalController.close(); } catch (_) {}
-  }
-}
-
-// =============================================================================
-// WORKER ISOLATE — cid.dll yükleme + FFI callback'leri burada çalışır.
-// Native crash olursa SADECE bu isolate ölür. Main isolate exit mesajı alır.
-// =============================================================================
-
-// Worker isolate'da SendPort'u tutmak için top-level (Pointer.fromFunction static gerektirir)
-SendPort? _workerSendPort;
-
-void _cidWorkerEntry(_WorkerArgs args) {
-  _workerSendPort = args.mainPort;
-  try {
-    // 1. Win32 LoadLibraryW pre-check
-    final preCheck = _tryLoadLibraryW(args.dllPath);
-    if (preCheck == 0) {
-      final err = _getLastErrorMessage();
-      args.mainPort.send(_WorkerInitError(
-        'cid.dll yüklenemedi (Win32 hata): $err\n'
-        'Çözüm: Visual C++ Redistributable kurun (https://aka.ms/vs/17/release/vc_redist.x64.exe) '
-        've cid.dll bağımlılıklarını kontrol edin.'
-      ));
-      return;
-    }
-
-    // 2. DynamicLibrary.open — pre-check geçti, güvenli
-    final DynamicLibrary dll;
-    try {
-      dll = DynamicLibrary.open(args.dllPath);
-    } catch (e) {
-      args.mainPort.send(_WorkerInitError('DynamicLibrary.open hata: $e'));
-      return;
-    }
-
-    // 3. SetEvents lookup
-    final _SetEventsDart setEvents;
-    try {
-      setEvents = dll.lookupFunction<_SetEventsNative, _SetEventsDart>('SetEvents');
-    } catch (e) {
-      args.mainPort.send(_WorkerInitError('SetEvents lookup hata: $e'));
-      return;
-    }
-
-    // 4. Callback pointer'lar (Pointer.fromFunction sadece static fonksiyon kabul eder)
-    final Pointer<NativeFunction<_CallerIdNative>> callerIdPtr;
-    final Pointer<NativeFunction<_SignalNative>> signalPtr;
-    try {
-      callerIdPtr = Pointer.fromFunction<_CallerIdNative>(_onCallerIdNative);
-      signalPtr = Pointer.fromFunction<_SignalNative>(_onSignalNative);
-    } catch (e) {
-      args.mainPort.send(_WorkerInitError('Callback pointer hata: $e'));
-      return;
-    }
-
-    // 5. SetEvents çağrısı — burada native crash olabilir
-    // try-catch yakalayamaz (segfault), ama isolate ölürse exit handler tetiklenir
-    try {
-      setEvents(callerIdPtr, signalPtr);
-    } catch (e) {
-      args.mainPort.send(_WorkerInitError('SetEvents çağrısı hata: $e'));
-      return;
-    }
-
-    // 6. Başarılı
-    args.mainPort.send(const _WorkerInitOk());
-
-    // 7. Isolate'ı canlı tut — native callback'ler tetiklenmesi için event loop açık olmalı
-    // ReceivePort kapanmadığı sürece isolate yaşar
-    final selfPort = ReceivePort();
-    selfPort.listen((_) {}); // hiç mesaj gelmeyecek ama port açık, isolate canlı
-  } catch (e, st) {
-    args.mainPort.send(_WorkerInitError('Worker isolate crash: $e\n$st'));
-  }
-}
-
-// Worker isolate içindeki yardımcılar
-int _tryLoadLibraryW(String path) {
-  if (!Platform.isWindows) return 0;
-  try {
-    final kernel32 = DynamicLibrary.open('kernel32.dll');
-    final loadLibrary = kernel32
-        .lookupFunction<IntPtr Function(Pointer<Utf16>), int Function(Pointer<Utf16>)>('LoadLibraryW');
-    final pathPtr = path.toNativeUtf16();
-    try {
-      return loadLibrary(pathPtr);
-    } finally {
-      calloc.free(pathPtr);
-    }
-  } catch (_) {
-    return 0;
-  }
-}
-
-String _getLastErrorMessage() {
-  if (!Platform.isWindows) return 'unknown';
-  try {
-    final kernel32 = DynamicLibrary.open('kernel32.dll');
-    final getLastError = kernel32.lookupFunction<Uint32 Function(), int Function()>('GetLastError');
-    final code = getLastError();
-    switch (code) {
-      case 126: return 'ERROR_MOD_NOT_FOUND (126) — bağımlı bir DLL bulunamadı (Visual C++ Redistributable eksik olabilir)';
-      case 127: return 'ERROR_PROC_NOT_FOUND (127) — fonksiyon bulunamadı';
-      case 193: return 'ERROR_BAD_EXE_FORMAT (193) — yanlış mimari (32/64-bit uyumsuz)';
-      case 998: return 'ERROR_NOACCESS (998) — bellek erişim hatası';
-      default: return 'Win32 error code $code';
-    }
-  } catch (_) {
-    return 'unknown';
-  }
-}
-
-// =============================================================================
-// Native callbacks — static (Pointer.fromFunction gerektiriyor)
-// Worker isolate context'inde çalışır, _workerSendPort üzerinden main'e iletir
-// =============================================================================
-
-void _onCallerIdNative(
-  Pointer<Utf16> serial,
-  Pointer<Utf16> line,
-  Pointer<Utf16> phone,
-  Pointer<Utf16> dt,
-  Pointer<Utf16> other,
-) {
-  try {
-    _workerSendPort?.send(_WorkerCallEvent(
-      _readUtf16(serial),
-      _readUtf16(line),
-      _readUtf16(phone),
-      DateTime.now().millisecondsSinceEpoch,
-      _readUtf16(other),
-    ));
-  } catch (_) {
-    // Native callback içinde exception THROW etme — DLL crash eder
-  }
-}
-
-void _onSignalNative(
-  Pointer<Utf16> model,
-  Pointer<Utf16> serial,
-  int s1,
-  int s2,
-  int s3,
-  int s4,
-) {
-  try {
-    _workerSendPort?.send(_WorkerSignal(
-      _readUtf16(model),
-      _readUtf16(serial),
-      s1, s2, s3, s4,
-    ));
-  } catch (_) {}
-}
-
-String _readUtf16(Pointer<Utf16> p) {
-  if (p == nullptr) return '';
-  try {
-    return p.toDartString();
-  } catch (_) {
-    return '';
+    stop();
+    _callController.close();
+    _signalController.close();
+    _statusController.close();
   }
 }

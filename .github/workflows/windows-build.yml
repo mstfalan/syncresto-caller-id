@@ -36,6 +36,26 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
+      - name: Build CallerId Helper (C# console exe)
+        shell: pwsh
+        run: |
+          $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (-not (Test-Path $csc)) {
+            $csc = (Get-ChildItem "$env:WINDIR\Microsoft.NET\Framework64" -Recurse -Filter csc.exe -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          }
+          if (-not $csc) { throw "csc.exe bulunamadi" }
+          Write-Host "csc: $csc"
+
+          $outDir = "assets\cid"
+          if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out-Null }
+          $outExe = "$outDir\SyncResto.CallerIdHelper.exe"
+
+          & $csc /nologo /target:exe /platform:x64 /optimize+ /out:"$outExe" helper\CallerIdHelper.cs
+          if ($LASTEXITCODE -ne 0) { throw "Helper build basarisiz: exit $LASTEXITCODE" }
+
+          Write-Host "Helper hazir: $outExe"
+          Get-Item $outExe | Format-List Name,Length
+
       - name: Build Windows
         run: flutter build windows --release
 
