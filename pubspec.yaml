@@ -1,7 +1,7 @@
 name: syncresto_caller_id
 description: "SyncResto Caller ID — Restoran gelen arama yöneticisi"
 publish_to: 'none'
-version: 0.1.0+1
+version: 0.2.0+6
 
 environment:
   sdk: ^3.11.0
