@@ -1,7 +1,7 @@
 name: syncresto_caller_id
 description: "SyncResto Caller ID — Restoran gelen arama yöneticisi"
 publish_to: 'none'
-version: 0.3.0+7
+version: 0.3.1+8
 
 environment:
   sdk: ^3.11.0
@@ -42,3 +42,5 @@ flutter:
     - assets/cid/cid_x86.dll
     - assets/cid/SyncResto.CallerIdHelper.exe
     - assets/images/logo.png
+    # Mozilla CA bundle — Windows boringssl sistem CA'yı kullanmaz (CERTIFICATE_VERIFY_FAILED fix)
+    - assets/certs/cacert.pem

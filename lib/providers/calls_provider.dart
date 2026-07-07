@@ -36,8 +36,7 @@ class CallsProvider extends ChangeNotifier {
         ..addAll(next);
       _error = null;
     } catch (e, st) {
-      // ignore: avoid_print
-      print('CALLS REFRESH ERROR: $e\n$st');
+      if (kDebugMode) debugPrint('CALLS REFRESH ERROR: $e\n$st');
       _error = 'Çağrılar alınamadı: $e';
     } finally {
       _loading = false;

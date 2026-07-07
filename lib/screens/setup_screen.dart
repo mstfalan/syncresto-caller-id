@@ -1,4 +1,5 @@
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -85,8 +86,7 @@ class _SetupScreenState extends State<SetupScreen> {
         }
       }
     } catch (e, st) {
-      // ignore: avoid_print
-      print('SETUP ERROR: $e\n$st');
+      if (kDebugMode) debugPrint('SETUP ERROR: $e\n$st');
       setState(() => _error = 'Beklenmedik hata: $e');
     } finally {
       if (mounted) setState(() => _busy = false);
