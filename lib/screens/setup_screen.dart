@@ -3,7 +3,6 @@ import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
-import '../core/config.dart';
 import '../core/secure_storage.dart';
 import '../providers/auth_provider.dart';
 import '../services/api_service.dart';
