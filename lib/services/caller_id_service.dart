@@ -50,7 +50,22 @@ class CallerIdService {
   String? _lastError;
   String? get lastError => _lastError;
 
-  Future<bool> initialize() async {
+  // Ayni anda iki baslatma (ör. "Tekrar Bagla"ya cift tik) iki helper acip birini
+  // sahipsiz birakiyordu; suren baslatma varsa onun sonucu beklenir.
+  Future<bool>? _surenBaslatma;
+
+  Future<bool> initialize() {
+    final suren = _surenBaslatma;
+    if (suren != null) return suren;
+    final f = _initialize();
+    _surenBaslatma = f;
+    f.whenComplete(() {
+      if (identical(_surenBaslatma, f)) _surenBaslatma = null;
+    });
+    return f;
+  }
+
+  Future<bool> _initialize() async {
     if (!Platform.isWindows) {
       _lastError = 'Caller ID donanimi sadece Windows uzerinde desteklenir';
       return false;
@@ -58,6 +73,10 @@ class CallerIdService {
     if (_initialized && _helper != null) return _ready;
 
     try {
+      // 0. Uygulama tek kopya (windows/runner/main.cpp kilidi): bu anda calisan baska
+      //    helper onceki acilistan kalmis sahipsiz surectir; cihazi ve dosyalari tutar -> kapat.
+      await _sahipsizHelperlariKapat();
+
       // 1. DLL'i temp'e cikar + hash dogrula
       final isX64 = _detectX64();
       final dllName = isX64 ? 'cid_x64.dll' : 'cid_x86.dll';
@@ -116,7 +135,8 @@ class CallerIdService {
       _statusController.add('Helper baslatildi, hazir bekleniyor...');
       return true;
     } catch (e, st) {
-      _lastError = 'CID init exception: $e';
+      final m = e.toString();
+      _lastError = m.startsWith('Exception: ') ? m.substring(11) : 'CID init exception: $m';
       if (kDebugMode) print('CID init: $e\n$st');
       return false;
     }
@@ -251,14 +271,51 @@ class CallerIdService {
     }
   }
 
+  Future<void> _sahipsizHelperlariKapat() async {
+    if (_helper != null) return; // kendi helper'imiz (reconnect once stop() eder)
+    try {
+      // Yalniz kendi Windows kullanicimizin surecleri (baska oturumdaki kopyaya dokunma).
+      final kullanici = Platform.environment['USERNAME'] ?? '';
+      final r = await Process.run(
+          'taskkill',
+          [
+            '/F', '/IM', 'SyncResto.CallerIdHelper.exe',
+            if (kullanici.isNotEmpty) ...['/FI', 'USERNAME eq $kullanici'],
+          ],
+          runInShell: false);
+      // 0 = kapatildi, 128 = calisan yok
+      if (r.exitCode == 0) {
+        _statusController.add('Onceki acilistan kalan helper kapatildi');
+        await Future.delayed(const Duration(milliseconds: 500));
+      }
+    } catch (_) {}
+  }
+
   Future<String> _extractAsset(String assetKey, String fileName) async {
     final tempDir = await getTemporaryDirectory();
     final outDir = Directory(p.join(tempDir.path, 'syncresto_cid'));
     if (!outDir.existsSync()) outDir.createSync(recursive: true);
     final outFile = File(p.join(outDir.path, fileName));
 
-    final bytes = await rootBundle.load(assetKey);
-    await outFile.writeAsBytes(bytes.buffer.asUint8List(), flush: true);
+    final bytes = (await rootBundle.load(assetKey)).buffer.asUint8List();
+    // Dosya zaten ayniysa yeniden yazma: baska bir surec (eski helper) yuklu tutuyorsa
+    // Windows uzerine yazmaya izin vermez (errno 32) ve baglanti hic kurulamazdi.
+    if (outFile.existsSync()) {
+      try {
+        final mevcut = await outFile.readAsBytes();
+        if (sha256.convert(mevcut) == sha256.convert(bytes)) return outFile.path;
+      } catch (_) {}
+    }
+    try {
+      await outFile.writeAsBytes(bytes, flush: true);
+    } on FileSystemException catch (e) {
+      if (e.osError?.errorCode == 32) {
+        throw Exception('Caller ID dosyası başka bir işlem tarafından kullanılıyor '
+            '(önceki açılıştan kalan SyncResto.CallerIdHelper.exe olabilir). Görev Yöneticisi\'nden '
+            'kapatın ya da bilgisayarı yeniden başlatıp "Tekrar Bağla"yı deneyin. ($fileName)');
+      }
+      rethrow;
+    }
     return outFile.path;
   }
 
